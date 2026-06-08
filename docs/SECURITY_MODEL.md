@@ -22,7 +22,7 @@ The platform does not protect against:
 - Attackers with physical or hypervisor-level access to the host
 - Misconfigured network infrastructure (exposed Redis, exposed PostgreSQL)
 
-These are deployer responsibilities, documented in [INSTALLATION.md](INSTALLATION.md) and [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md).
+These are deployer responsibilities, documented in [INSTALLATION.md](INSTALLATION.md).
 
 ---
 
@@ -41,7 +41,9 @@ Token issuance happens at `POST /api/auth/login`. Tokens are not refreshed — t
 
 ### Session termination
 
-`POST /api/auth/logout` clears the httpOnly cookie on the client side. The token itself is not actively revoked — there is no token revocation list. If a token must be invalidated immediately (compromise scenario), rotate `SECRET_KEY`, which invalidates all tokens for all users simultaneously.
+`POST /api/auth/logout` records a per-user `tokens_invalidated_at` timestamp, clears the httpOnly cookie, and evicts the token from the in-process authentication cache. Any token issued at or before that timestamp is rejected on later use.
+
+If all tokens must be invalidated immediately (for example, after `SECRET_KEY` exposure), rotate `SECRET_KEY`. That invalidates every signed token for every user simultaneously.
 
 ### Production requirements
 
@@ -111,7 +113,16 @@ The API enforces CORS using the `ALLOWED_ORIGINS` list. Requests from any origin
 
 ### Application secrets
 
-`SECRET_KEY` is the only cryptographic secret the application manages directly. See [SECURITY_SECRET_HANDLING.md](SECURITY_SECRET_HANDLING.md) for the complete handling policy.
+`SECRET_KEY` is the primary cryptographic secret the application manages directly. It signs JWTs and derives the Fernet key used by the database at-rest protection helpers. It must be generated uniquely per deployment, stored outside source control, and rotated after any suspected exposure.
+
+### Database at-rest protection
+
+Sensitive operational fields use SQLAlchemy type decorators backed by Fernet helpers:
+- `EncryptedJSON` wraps JSON columns in an encrypted JSON envelope before persistence
+- `EncryptedText` stores text values with a versioned encrypted prefix
+- Legacy plaintext rows are still readable and are protected the next time they are written
+
+These helpers protect configured sensitive columns such as connectivity profile config, assessment collection config, offensive job steps, job loot, job params, operator approval params, and streamed job output lines. They do not replace host disk encryption, database access controls, or careful backup handling.
 
 ### Credential data
 
@@ -179,9 +190,9 @@ These checks prevent common deployment misconfigurations from reaching productio
 
 ## Known limitations
 
-- **No token revocation** — compromised tokens remain valid until expiry; the only immediate revocation mechanism is `SECRET_KEY` rotation, which affects all sessions
+- **No distributed token revocation cache** — logout invalidation is persisted per user and the current process cache is evicted, but multi-process deployments may accept a recently cached token until each process refreshes it or the JWT expires. Rotate `SECRET_KEY` for immediate global invalidation after compromise.
 - **No rate limiting on all endpoints** — only authentication endpoints are rate limited; internal API endpoints rely on authentication for access control
-- **No field-level encryption** — sensitive fields in the database (finding details, hash values, entity attributes) are stored in plaintext; disk encryption at the host level is the deployer's responsibility
+- **At-rest protection is column-scoped** — selected sensitive operational JSON/text columns are encrypted with Fernet-derived helpers, but not every database field is encrypted. Host disk encryption, database access control, and encrypted backups remain deployer responsibilities
 - **SQLite is not safe for production** — the startup validation enforces this, but SQLite provides no access control and no network isolation
 
 ---
