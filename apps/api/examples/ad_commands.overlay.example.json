@@ -1,0 +1,24 @@
+{
+  "category_descriptions": {
+    "Private Lab Playbooks": "Locally managed operator playbooks. Not committed to the shared repository."
+  },
+  "commands": [
+    {
+      "id": "local-template-example",
+      "category": "Private Lab Playbooks",
+      "title": "Local Operator Template",
+      "tool": "python3",
+      "platform": "linux",
+      "executable_on_linux": false,
+      "description": "Example overlay entry. Replace locally with your own authorized lab workflow.",
+      "commands": [
+        {
+          "label": "Template command",
+          "command": "python3 local_tool.py --target {Target}",
+          "params": ["Target"],
+          "platform": "linux"
+        }
+      ]
+    }
+  ]
+}

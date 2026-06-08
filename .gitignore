@@ -1,0 +1,116 @@
+# Release artifacts
+adbygod-*.tar.gz
+adbygod-*.zip
+*.7z
+
+# Core crash dumps
+/core
+/core.*
+
+# Redis snapshots
+dump.rdb
+
+# Python
+__pycache__/
+__pycache__.unwritable*/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+apps/api/.venv/
+
+# Node / Next
+node_modules/
+.next/
+apps/web/.next/
+apps/web/.next.unwritable.*/
+apps/web/.next-local-build/
+apps/web/.next-types/
+apps/web/tsconfig.tsbuildinfo
+apps/web/next-env.d.ts.root-owned
+
+# Python test/build caches
+.pytest_cache/
+apps/api/.pytest_cache/
+apps/web/.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env / secrets
+.env
+.env.*
+*.env
+!.env.example
+!.env*.example
+apps/api/.env
+apps/web/.env
+.admin-dev-password
+*.ccache
+*.kirbi
+*.key
+*.pem
+*.pfx
+*.p12
+krb5cc*
+
+# Local artifacts
+.logs/
+*.log
+*.pid
+apps/api/adbygod.db
+apps/api/adbygod.db-*
+*.db
+.dev-runtime/
+.adbygod-runtime/
+graphify-out/
+apps/web/tmp/
+tmp/
+temp/
+.DS_Store
+
+# Dev-only root scripts and profiles
+fix_*.py
+.dev-profile.json
+
+# Runtime output directories (created by collection/report features)
+headers/
+html/
+screenshots/
+apps/api/headers/
+apps/api/html/
+apps/api/screenshots/
+reports/
+apps/api/reports/
+uploads/
+apps/api/uploads/
+bloodhound-output/
+collector-output/
+local-output/
+
+# Build / dist / coverage artefacts
+dist/
+build/
+coverage/
+
+# Settings with local overrides
+*.local.json
+task_plan.md
+findings.md
+progress.md
+.worktrees/
+
+# Editor / OS
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Ligolo tunnel configs
+ligolo-ng.yaml
+ligolo-*.yaml
+
+# SQLite databases
+*.sqlite
+*.sqlite3
+*.bak
+*.bak_*

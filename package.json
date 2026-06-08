@@ -1,0 +1,32 @@
+{
+  "name": "adbygod",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Enterprise Identity Exposure Validation and Remediation Intelligence Platform",
+  "author": "White0xdi3",
+  "workspaces": [
+    "apps/web",
+    "packages/*"
+  ],
+  "scripts": {
+    "prepare-runtime": "bash scripts/dev/prepare-runtime.sh",
+    "install:local": "bash scripts/dev/install-node-deps.sh && cd apps/api && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
+    "install:compact": "npm run install:local",
+    "dev": "cd apps/web && npm run dev",
+    "lint": "npm --prefix apps/web run lint",
+    "type-check": "npm --prefix apps/web run type-check -- --pretty false",
+    "test": "npm run test:api",
+    "test:api": "python -m pytest apps/api/tests",
+    "audit": "npm audit --omit=dev --audit-level=high && node scripts/security/verify-next-postcss.mjs",
+    "check": "bash scripts/dev/check.sh",
+    "build": "cd apps/web && npm run build",
+    "api": "bash scripts/dev/run-api.sh",
+    "start": "bash start.sh",
+    "stop": "bash stop.sh",
+    "clean": "bash clean.sh",
+    "collect": "python collectors/linux_remote/collect.py"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

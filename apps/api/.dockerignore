@@ -1,0 +1,43 @@
+# Never send secrets or dev artifacts to the Docker daemon
+.env
+.env.*
+!.env.example
+!.env*.example
+
+# Python caches and dev tooling
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Database files (baked-in DB state is dangerous)
+*.db
+*.sqlite
+*.sqlite3
+
+# Test suite (not needed in the image)
+tests/
+
+# Dev scripts and examples
+examples/
+scripts/
+fix_*.py
+
+# Credential and security artefacts
+*.pem
+*.key
+*.p12
+*.pfx
+*.ccache
+*.kirbi
+*.ticket
+krb5cc*
+
+# Runtime data directories that should never be baked in
+data/
+headers/
+html/
+screenshots/
+reports/
+uploads/

@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible bug using synthetic or local data only.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include real client data, secrets, tokens, hashes, screenshots with sensitive content, private keys, or raw engagement evidence.
+        Security vulnerabilities should be reported privately using SECURITY.md, not public issues.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic data or local fixtures.
+      placeholder: |
+        1. Start ...
+        2. Import ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python, Node, browser, database, deployment mode.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Redact secrets, hostnames, usernames, domains, IPs, and evidence before posting.
+      render: text

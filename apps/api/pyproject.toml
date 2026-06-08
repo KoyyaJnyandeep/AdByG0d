@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # line too long — handled per-project style
+
+[tool.ruff.lint.per-file-ignores]
+# Test files manipulate sys.path before importing project modules — E402 is intentional
+"tests/conftest.py" = ["E402"]
+"tests/test_authz_isolation.py" = ["E402"]
+"tests/test_laps_coverage_regressions.py" = ["E402"]
+"tests/test_linux_collector_cli.py" = ["E402"]
+"tests/test_validation_consensus.py" = ["E402"]
+"tests/test_operator_tools_e2e.py" = ["E402"]
+# Trailing whitespace in multiline test data strings is intentional (preserves field format)
+"tests/test_collector_import.py" = ["W291"]

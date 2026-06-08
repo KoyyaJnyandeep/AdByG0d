@@ -1,0 +1,129 @@
+# AdByG0d — Production Docker Compose
+#
+# Prerequisites:
+#   1. Copy .env.docker.example to .env and fill in production values.
+#   2. Generate a strong SECRET_KEY:
+#        python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+#   3. Set POSTGRES_PASSWORD to a real database password.
+#   4. Set AUTH_COOKIE_SECURE=true and explicit ALLOWED_ORIGINS behind HTTPS.
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up --build -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-adbygod}
+      - POSTGRES_USER=${POSTGRES_USER:-adbygod}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env for production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-adbygod} -d ${POSTGRES_DB:-adbygod}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - api_data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env for production}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-adbygod}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env for production}@postgres:5432/${POSTGRES_DB:-adbygod}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE:-true}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS in .env for production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - adbygod_api.core.celery_app:celery_app
+      - worker
+      - --loglevel=info
+      - --queues=offensive_jobs
+    volumes:
+      - api_data:/app/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env for production}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-adbygod}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env for production}@postgres:5432/${POSTGRES_DB:-adbygod}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE:-true}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS in .env for production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are baked at build time; must be provided here.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?Set NEXT_PUBLIC_API_URL in .env for production}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:?Set NEXT_PUBLIC_API_URL in .env for production}
+      - API_URL=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  api_data:
+  postgres_data:

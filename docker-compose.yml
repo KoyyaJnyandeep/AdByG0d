@@ -1,0 +1,117 @@
+# AdByG0d — Development Docker Compose
+# For local development only. See docker-compose.prod.yml for production.
+#
+# Usage: docker compose up
+#
+# Services:
+#   api    — FastAPI backend on :8000 (hot reload via uvicorn --reload)
+#   worker — Celery worker for async/offensive job queue
+#   web    — Next.js frontend on :3000
+#   redis  — Redis for job queue and pub/sub
+#
+# Prerequisites:
+#   Copy .env.docker.example → .env and set SECRET_KEY.
+#   For manual non-Docker development, use apps/api/.env.example and apps/web/.env.example.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+      - api_data:/app/data
+    # Override the production CMD with uvicorn --reload for live code reloading
+    command:
+      - python
+      - -m
+      - uvicorn
+      - adbygod_api.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --app-dir
+      - src
+      - --reload
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/adbygod.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - SECRET_KEY=${SECRET_KEY:-CHANGE_ME_DEVELOPMENT_ONLY}
+      - DEBUG=true
+    # Uncomment to load from env file instead:
+    # env_file: ./apps/api/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - adbygod_api.core.celery_app:celery_app
+      - worker
+      - --loglevel=info
+      - --queues=offensive_jobs
+    volumes:
+      - ./apps/api:/app
+      - api_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/adbygod.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - SECRET_KEY=${SECRET_KEY:-CHANGE_ME_DEVELOPMENT_ONLY}
+      - DEBUG=true
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are baked at build time; pass them here too.
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - API_URL=http://api:8000
+    # Uncomment to load from env file:
+    # env_file: ./apps/web/.env
+    depends_on:
+      - api
+
+volumes:
+  api_data:
