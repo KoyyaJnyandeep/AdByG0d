@@ -76,6 +76,7 @@ fix_*.py
 headers/
 html/
 screenshots/
+!docs/screenshots/
 apps/api/headers/
 apps/api/html/
 apps/api/screenshots/
