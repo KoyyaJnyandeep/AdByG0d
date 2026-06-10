@@ -16,7 +16,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from adbygod_api.database import get_db
-from adbygod_api.models import Entity, ExposurePath, GraphEdge, PlatformUser
+from adbygod_api.models import Entity, ExposurePath, GraphEdge, GraphProjectionState, PlatformUser
 from adbygod_api.schemas import GraphData
 from adbygod_api.core.graph.attack_flow_chains import attack_flow_categories, list_attack_flow_chains
 from adbygod_api.core.graph.graph_service import ADGraphAnalyzer
@@ -1471,4 +1471,55 @@ async def diff_assessment(
             "new_edges": len(added_edges),
             "removed_edges": len(removed_edges),
         },
+    }
+
+
+def _enqueue_projection(assessment_id) -> None:
+    from adbygod_api.core.tasks.graph_projection import project_assessment
+    project_assessment.delay(str(assessment_id))
+
+
+@router.post("/{assessment_id}/reproject", status_code=202)
+async def reproject_graph(
+    assessment_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: PlatformUser = Depends(get_current_user),
+):
+    """Enqueue a (re)projection of the assessment graph into Neo4j."""
+    await require_assessment_write_access(assessment_id, db, current_user)
+    state = await db.get(GraphProjectionState, assessment_id)
+    if state is None:
+        state = GraphProjectionState(assessment_id=assessment_id)
+        db.add(state)
+    state.status = "projecting"
+    await db.commit()
+    _enqueue_projection(assessment_id)
+    return {"status": "projecting", "assessment_id": str(assessment_id)}
+
+
+@router.get("/{assessment_id}/projection-state")
+async def get_projection_state(
+    assessment_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: PlatformUser = Depends(get_current_user),
+):
+    """Return the current Neo4j projection state for an assessment."""
+    await require_assessment_access(assessment_id, db, current_user)
+    state = await db.get(GraphProjectionState, assessment_id)
+    if state is None:
+        return {
+            "assessment_id": str(assessment_id),
+            "status": "pending",
+            "node_count": 0,
+            "edge_count": 0,
+            "last_projected_at": None,
+        }
+    return {
+        "assessment_id": str(assessment_id),
+        "status": state.status,
+        "node_count": state.node_count,
+        "edge_count": state.edge_count,
+        "last_projected_at": (
+            state.last_projected_at.isoformat() if state.last_projected_at else None
+        ),
     }

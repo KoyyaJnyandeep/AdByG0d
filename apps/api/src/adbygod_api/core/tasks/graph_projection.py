@@ -9,12 +9,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 
 from adbygod_api.core.celery_app import celery_app
 from adbygod_api.core.graph import neo4j_client, projection
 from adbygod_api.database import AsyncSessionLocal
+from adbygod_api.models import GraphProjectionState, _utcnow_naive
 
 log = logging.getLogger(__name__)
+
+
+async def _set_state(assessment_id: uuid.UUID, **fields) -> None:
+    """Upsert the projection-state row for an assessment in a fresh session."""
+    async with AsyncSessionLocal() as db:
+        state = await db.get(GraphProjectionState, assessment_id)
+        if state is None:
+            state = GraphProjectionState(assessment_id=assessment_id)
+            db.add(state)
+        for key, value in fields.items():
+            setattr(state, key, value)
+        await db.commit()
 
 
 async def _run(assessment_id: str) -> dict[str, int]:
@@ -23,10 +37,35 @@ async def _run(assessment_id: str) -> dict[str, int]:
     # loop alive at creation, so a singleton reused across tasks would operate
     # on a closed loop and fail on the 2nd task in a long-lived worker. Closing
     # here forces the next connect() to build a fresh driver on the new loop.
+    aid = uuid.UUID(assessment_id)
     await neo4j_client.connect()
     try:
         async with AsyncSessionLocal() as db:
-            return await projection.reproject_assessment(db, assessment_id)
+            result = await projection.reproject_assessment(db, assessment_id)
+
+        # The projection already succeeded; a failure writing "ready" state must
+        # NOT propagate (it would retry the expensive projection and wrongly mark
+        # the assessment "error"). Log and swallow — state can be re-derived.
+        try:
+            await _set_state(
+                aid,
+                status="ready",
+                node_count=result.get("nodes", 0),
+                edge_count=result.get("edges", 0),
+                last_projected_at=_utcnow_naive(),
+            )
+        except Exception as state_err:
+            log.warning("Failed to write ready state for assessment %s: %s", assessment_id, state_err)
+
+        return result
+    except Exception:
+        # Record error state in a fresh session — the projection session may be
+        # unusable after an exception. Never let the state write mask the original.
+        try:
+            await _set_state(aid, status="error")
+        except Exception as state_err:
+            log.warning("Failed to record error state for assessment %s: %s", assessment_id, state_err)
+        raise
     finally:
         await neo4j_client.close()
 
