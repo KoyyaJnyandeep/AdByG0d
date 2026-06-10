@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # Graph engine (Neo4j) — required in all environments, no NetworkX fallback
+    NEO4J_URI: str = "bolt://localhost:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = ""
+    NEO4J_DATABASE: str = "neo4j"
+    GRAPH_QUERY_TIMEOUT_SECONDS: int = 30
+    GRAPH_PROJECT_BATCH_SIZE: int = 10000
+
     # Celery — broker and result backend
     # Defaults to a separate Redis DB so job results don't collide with pub/sub.
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
@@ -182,6 +190,12 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "AUTH_COOKIE_SECURE must be true in production to prevent session token "
                 "transmission over insecure connections."
+            )
+
+        if self.is_production and not self.NEO4J_PASSWORD.strip():
+            raise RuntimeError(
+                "NEO4J_PASSWORD must be set in production; the graph engine is a hard "
+                "dependency with no fallback."
             )
 
         lowered = secret.lower()
