@@ -15,6 +15,9 @@ BASE_SAFE_PROD_CONFIG = {
     "ALLOWED_ORIGINS": "https://example.com",
     "AUTH_COOKIE_SECURE": True,
     "DEBUG": False,
+    # Neo4j is a hard production dependency (no NetworkX fallback), so a valid
+    # production config must set NEO4J_PASSWORD — see Settings.validate_runtime.
+    "NEO4J_PASSWORD": "prod-neo4j-secret",
 }
 
 

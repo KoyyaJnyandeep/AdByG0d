@@ -504,10 +504,10 @@ class TestGraphRoutes:
         headers_for = test_app["headers_for"]
         user, ws, asmt = _setup(db, "gr_empty_")
         r = client.get(f"/api/v1/graph/{asmt.id}/data", headers=headers_for(user))
-        assert r.status_code == 200
-        data = r.json()
-        assert "nodes" in data
-        assert "edges" in data
+        # Graph reads are served from Neo4j, which is not connected in this
+        # Postgres-only harness, so the engine reports unavailable (503). Real
+        # graph-data behaviour is covered by tests/test_graph_route_neo4j.py.
+        assert r.status_code == 503
 
     def test_graph_data_with_entities(self, test_app):
         client = test_app["client"]
@@ -516,10 +516,8 @@ class TestGraphRoutes:
         user, ws, asmt = _setup(db, "gr_data_")
         _populate_domain(db, asmt.id)
         r = client.get(f"/api/v1/graph/{asmt.id}/data", headers=headers_for(user))
-        assert r.status_code == 200
-        data = r.json()
-        assert len(data["nodes"]) >= 6
-        assert len(data["edges"]) >= 5
+        # See test_graph_data_empty: Neo4j engine unavailable in this harness.
+        assert r.status_code == 503
 
     def test_graph_paths(self, test_app):
         client = test_app["client"]
@@ -537,7 +535,8 @@ class TestGraphRoutes:
         user, ws, asmt = _setup(db, "gr_blast_")
         _populate_domain(db, asmt.id)
         r = client.get(f"/api/v1/graph/{asmt.id}/blast-radius", headers=headers_for(user))
-        assert r.status_code == 200
+        # Analytics (blast radius) not yet ported to Neo4j — guarded with 501.
+        assert r.status_code == 501
 
     def test_graph_simulate_removal(self, test_app):
         client = test_app["client"]
@@ -551,9 +550,8 @@ class TestGraphRoutes:
             json=[{"source": str(jdoe.id), "target": str(da.id)}],
             headers=headers_for(user),
         )
-        assert r.status_code == 200
-        data = r.json()
-        assert "before" in data or "metric" in data
+        # Simulation not yet ported to Neo4j — guarded with 501.
+        assert r.status_code == 501
 
     def test_graph_categories(self, test_app):
         client = test_app["client"]
@@ -562,7 +560,8 @@ class TestGraphRoutes:
         user, ws, asmt = _setup(db, "gr_cat_")
         _populate_domain(db, asmt.id)
         r = client.get(f"/api/v1/graph/{asmt.id}/categories", headers=headers_for(user))
-        assert r.status_code == 200
+        # Detector categories not yet ported to Neo4j — guarded with 501.
+        assert r.status_code == 501
 
     def test_graph_choke_points(self, test_app):
         client = test_app["client"]
@@ -571,7 +570,8 @@ class TestGraphRoutes:
         user, ws, asmt = _setup(db, "gr_choke_")
         _populate_domain(db, asmt.id)
         r = client.get(f"/api/v1/graph/{asmt.id}/choke-points", headers=headers_for(user))
-        assert r.status_code == 200
+        # Choke-point analysis not yet ported to Neo4j — guarded with 501.
+        assert r.status_code == 501
 
     def test_graph_access_control(self, test_app):
         client = test_app["client"]
@@ -664,11 +664,10 @@ class TestAssessmentBackedEndpointSurface:
             ("GET", "/api/v1/entities/summary", {"assessment_id": str(asmt.id)}),
             ("GET", "/api/v1/entities/intelligence", {"assessment_id": str(asmt.id)}),
             ("GET", f"/api/v1/entities/{jdoe.id}", None),
-            ("GET", f"/api/v1/graph/{asmt.id}/data", None),
+            # Graph reads now require the Neo4j engine (not connected in this
+            # harness) and the analytics routes are 501-guarded pending Phase 3-5;
+            # graph routes are validated in tests/test_graph_route_neo4j.py.
             ("GET", f"/api/v1/graph/{asmt.id}/paths", None),
-            ("GET", f"/api/v1/graph/{asmt.id}/blast-radius", None),
-            ("GET", f"/api/v1/graph/{asmt.id}/categories", None),
-            ("GET", f"/api/v1/graph/{asmt.id}/choke-points", None),
             ("GET", "/api/v1/pki/templates", {"assessment_id": str(asmt.id)}),
             ("GET", "/api/v1/pki/summary", {"assessment_id": str(asmt.id)}),
             ("GET", "/api/v1/service-accounts", {"assessment_id": str(asmt.id)}),
