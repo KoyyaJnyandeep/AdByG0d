@@ -1,0 +1,15 @@
+# Lightweight dev stack: Neo4j (+GDS+APOC) so local dev runs the same graph
+# code path as prod. Compose with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up neo4j redis
+services:
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-adbygod_dev}
+      NEO4J_PLUGINS: '["graph-data-science","apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: gds.*,apoc.*
+      NEO4J_server_memory_heap_max__size: 512M
+      NEO4J_server_memory_pagecache_size: 256M
+    ports:
+      - "7474:7474"
+      - "7687:7687"
