@@ -225,8 +225,8 @@ async def _annotate_entity(args: dict, ctx) -> dict:
     await _commit_db(ctx)
     if aid:
         try:
-            from adbygod_api.routes.graph import invalidate_graph_cache
-            invalidate_graph_cache(str(aid))
+            from adbygod_api.core.tasks.graph_projection import enqueue
+            enqueue(str(aid))
         except Exception:
             pass
         try:

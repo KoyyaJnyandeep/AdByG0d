@@ -19,6 +19,16 @@ from adbygod_api.models import GraphProjectionState, _utcnow_naive
 log = logging.getLogger(__name__)
 
 
+def enqueue(assessment_id: str) -> None:
+    """Fire-and-forget: queue a Neo4j re-projection for ``assessment_id``.
+
+    Single source for enqueuing projection so callers (ingest, the reproject
+    route, ai_operator tools) don't each duplicate the ``.delay`` call or
+    reach across layers for it.
+    """
+    project_assessment.delay(str(assessment_id))
+
+
 async def _set_state(assessment_id: uuid.UUID, **fields) -> None:
     """Upsert the projection-state row for an assessment in a fresh session."""
     async with AsyncSessionLocal() as db:

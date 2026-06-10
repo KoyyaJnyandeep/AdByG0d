@@ -1475,8 +1475,8 @@ async def diff_assessment(
 
 
 def _enqueue_projection(assessment_id) -> None:
-    from adbygod_api.core.tasks.graph_projection import project_assessment
-    project_assessment.delay(str(assessment_id))
+    from adbygod_api.core.tasks.graph_projection import enqueue
+    enqueue(assessment_id)
 
 
 @router.post("/{assessment_id}/reproject", status_code=202)

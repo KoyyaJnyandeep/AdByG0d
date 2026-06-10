@@ -97,6 +97,12 @@ def _coerce_datetime(value: object) -> datetime | None:
         return None
 
 
+def _enqueue_projection_after_ingest(assessment_id: str) -> None:
+    """Enqueue a Neo4j re-projection after ingest commits (Postgres is source of truth)."""
+    from adbygod_api.core.tasks.graph_projection import enqueue
+    enqueue(assessment_id)
+
+
 def _pick_datetime(raw: dict, attrs: dict, *keys: str) -> datetime | None:
     for key in keys:
         if key in raw:
@@ -1395,9 +1401,8 @@ async def _process_ingest(assessment_id: UUID, payload: CollectorIngest, job_id:
 
             await db.commit()
 
-            # Invalidate graph cache so next graph request reflects new data
-            from adbygod_api.routes.graph import invalidate_graph_cache
-            invalidate_graph_cache(str(assessment_id))
+            # Re-project the assessment graph into Neo4j (source of truth = Postgres)
+            _enqueue_projection_after_ingest(str(assessment_id))
 
             log.info(
                 "Assessment %s completed. Score: %s, Findings: %s",
