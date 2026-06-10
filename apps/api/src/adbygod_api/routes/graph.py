@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import time
-from datetime import datetime, timezone
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 from uuid import UUID as _UUID
 
@@ -15,13 +13,25 @@ import dataclasses
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
+
+from adbygod_api.config import settings
 from adbygod_api.database import get_db
-from adbygod_api.models import Entity, ExposurePath, GraphEdge, PlatformUser
+from adbygod_api.models import ExposurePath, GraphProjectionState, PlatformUser
 from adbygod_api.schemas import GraphData
 from adbygod_api.core.graph.attack_flow_chains import attack_flow_categories, list_attack_flow_chains
-from adbygod_api.core.graph.graph_service import ADGraphAnalyzer
+from adbygod_api.core.graph.neo4j_graph_service import Neo4jGraphService
 from adbygod_api.core.security.authorization import require_assessment_access, require_assessment_write_access
 from adbygod_api.routes.auth import get_current_user
+
+# Routes for analytics not yet ported to the Neo4j engine (spec Phases 3-5:
+# centrality, community detection, detectors, blast radius, simulation). They
+# return 501 until those phases land, so the app imports and the merge-gate
+# routes work. Listed in the PR description.
+_PHASE3_DETAIL = (
+    "This graph analytic is not yet available on the Neo4j engine "
+    "(scheduled for a follow-on phase of the Neo4j migration)."
+)
 
 
 class EdgeRemoval(BaseModel):
@@ -102,24 +112,34 @@ def _run_monte_carlo(path_steps: list, iterations: int = 1000) -> dict:
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 
-_graph_cache: dict[str, tuple[float, ADGraphAnalyzer]] = {}
-_CACHE_TTL = 300  # 5 minutes
-_CACHE_MAX = 50   # max cached analyzers — evict LRU entries beyond this
-_graph_cache_lock = asyncio.Lock()
-_PATH_TIMEOUT = 30.0  # seconds before path computation is aborted
+def _get_service(assessment_id: str) -> Neo4jGraphService:
+    """Per-request handle to the Neo4j-backed graph engine for one assessment.
+
+    No caching: Neo4j keeps the projected graph; each call is index-free
+    adjacency over the live read-model (replaces the old in-memory analyzer
+    cache, which was the source of stale-graph bugs)."""
+    return Neo4jGraphService(str(assessment_id))
 
 
-async def _run_path_with_timeout(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    work = asyncio.to_thread(func, *args, **kwargs)
+async def _run_query(coro: Any) -> Any:
+    """Await a graph-engine coroutine, mapping engine failures to HTTP errors.
+
+    - query exceeding GRAPH_QUERY_TIMEOUT_SECONDS  -> 503 (too large / slow)
+    - Neo4j unavailable / driver not initialised    -> 503 (engine unavailable)
+    """
     try:
-        return await asyncio.wait_for(work, timeout=_PATH_TIMEOUT)
-    except asyncio.TimeoutError:
-        # Some test doubles raise before wait_for consumes the coroutine.
-        # Close it so timeout responses do not leak RuntimeWarning noise.
-        try:
-            work.close()
-        except RuntimeError:
-            pass
+        return await asyncio.wait_for(coro, timeout=settings.GRAPH_QUERY_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Graph query timed out — graph may be too large; narrow the query (source/target) or reduce scope.",
+        ) from exc
+    except (ServiceUnavailable, Neo4jError) as exc:
+        raise HTTPException(status_code=503, detail="graph engine unavailable") from exc
+    except RuntimeError as exc:
+        # neo4j_client.get_driver() raises this when the driver isn't connected.
+        if "driver not initialised" in str(exc).lower() or "not initialized" in str(exc).lower():
+            raise HTTPException(status_code=503, detail="graph engine unavailable") from exc
         raise
 
 
@@ -138,36 +158,6 @@ async def get_attack_flow_chains():
         "critical_count": sum(1 for chain in chains if chain.get("risk_level") == "CRITICAL"),
         "edge_type_counts": edge_type_counts,
     }
-
-
-def invalidate_graph_cache(assessment_id: str) -> None:
-    _graph_cache.pop(assessment_id, None)
-
-
-async def _get_analyzer(assessment_id: str, db: AsyncSession) -> ADGraphAnalyzer:
-    async with _graph_cache_lock:
-        cached = _graph_cache.get(assessment_id)
-        if cached:
-            ts, analyzer = cached
-            if time.monotonic() - ts < _CACHE_TTL:
-                _graph_cache[assessment_id] = (time.monotonic(), analyzer)
-                return analyzer
-
-    # DB queries outside the lock — these are the expensive part
-    entities_result = await db.execute(select(Entity).where(Entity.assessment_id == _UUID(str(assessment_id))))
-    edges_result = await db.execute(select(GraphEdge).where(GraphEdge.assessment_id == _UUID(str(assessment_id))))
-
-    analyzer = ADGraphAnalyzer()
-    analyzer.load_from_db(entities_result.scalars().all(), edges_result.scalars().all())
-
-    async with _graph_cache_lock:
-        _graph_cache[assessment_id] = (time.monotonic(), analyzer)
-        if len(_graph_cache) > _CACHE_MAX:
-            oldest = sorted(_graph_cache.items(), key=lambda kv: kv[1][0])
-            for key, _ in oldest[:len(_graph_cache) - _CACHE_MAX]:
-                _graph_cache.pop(key, None)
-
-    return analyzer
 
 
 def _risk_level(score: float) -> str:
@@ -231,8 +221,10 @@ async def get_graph_data(
     """Return full graph nodes+edges for the frontend visualizer."""
     await require_assessment_access(assessment_id, db, current_user)
     filter_types = entity_types.split(",") if entity_types else None
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    data = analyzer.export_for_frontend(max_nodes=max_nodes, filter_types=filter_types)
+    service = _get_service(str(assessment_id))
+    data = await _run_query(
+        service.export_for_frontend(max_nodes=max_nodes, filter_types=filter_types)
+    )
     return GraphData(**data)
 
 
@@ -249,29 +241,28 @@ async def get_exposure_paths(
     db: AsyncSession = Depends(get_db),
     current_user: PlatformUser = Depends(get_current_user),
 ):
-    """Compute and return exposure paths."""
+    """Compute and return exposure paths from the Neo4j engine."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
+    service = _get_service(str(assessment_id))
 
     paths = None
-    try:
-        if source_id and target_id:
-            if directed:
-                raw = await _run_path_with_timeout(analyzer.find_directed_path, source_id, target_id)
-                paths = [raw] if raw else []
-            elif algorithm == "yen":
-                paths = await _run_path_with_timeout(analyzer.find_k_shortest_paths, source_id, target_id, k)
-            else:
-                paths = await _run_path_with_timeout(analyzer.get_all_paths, source_id, target_id, max_paths=max_paths)
-        elif source_id:
-            paths = await _run_path_with_timeout(analyzer.get_paths_to_tier0, source_id, max_paths=max_paths)
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Path computation timed out — graph may be too large; try with a specific source_id or reduce scope",
-        ) from exc
+    if source_id and target_id:
+        if directed:
+            ap = await _run_query(service.find_shortest_path(source_id, target_id))
+            paths = [ap] if ap else []
+        elif algorithm == "yen":
+            paths = await _run_query(service.find_k_shortest_paths(source_id, target_id, k=k))
+        else:
+            paths = await _run_query(
+                service.find_all_shortest_paths(source_id, target_id, limit=max_paths)
+            )
+    elif source_id:
+        # Source-only "paths to Tier-0" needs Tier-0 enumeration + multi-target
+        # search, not yet ported to the Neo4j engine.
+        raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
     if paths is None:
+        # No source given: serve previously computed/persisted exposure paths.
         q = select(ExposurePath).where(ExposurePath.assessment_id == assessment_id)
         if tier is not None:
             q = q.where(ExposurePath.target_tier == tier)
@@ -280,16 +271,10 @@ async def get_exposure_paths(
         rows = []
         for ep in ep_result.scalars().all():
             steps = ep.path_steps or []
-            source_label = (
-                steps[0].get("entity_label")
-                if steps and isinstance(steps[0], dict)
-                else analyzer._label_of(str(ep.source_entity_id)) if ep.source_entity_id else None
-            )
-            target_label = (
-                steps[-1].get("entity_label")
-                if steps and isinstance(steps[-1], dict)
-                else analyzer._label_of(str(ep.target_entity_id)) if ep.target_entity_id else None
-            )
+            first = steps[0] if steps and isinstance(steps[0], dict) else {}
+            last = steps[-1] if steps and isinstance(steps[-1], dict) else {}
+            source_label = first.get("entity_label") or (str(ep.source_entity_id) if ep.source_entity_id else None)
+            target_label = last.get("entity_label") or (str(ep.target_entity_id) if ep.target_entity_id else None)
             edge_types = [
                 step.get("edge_type")
                 for step in steps
@@ -297,8 +282,8 @@ async def get_exposure_paths(
             ]
             rows.append({
                 "id": str(ep.id),
-                "source_id": str(ep.source_entity_id) if ep.source_entity_id else (steps[0].get("entity_id") if steps and isinstance(steps[0], dict) else None),
-                "target_id": str(ep.target_entity_id) if ep.target_entity_id else (steps[-1].get("entity_id") if steps and isinstance(steps[-1], dict) else None),
+                "source_id": str(ep.source_entity_id) if ep.source_entity_id else first.get("entity_id"),
+                "target_id": str(ep.target_entity_id) if ep.target_entity_id else last.get("entity_id"),
                 "source_label": source_label or "Unknown source",
                 "target_label": target_label or "Unknown target",
                 "path_steps": steps,
@@ -314,19 +299,19 @@ async def get_exposure_paths(
 
     return [
         {
-            "source": path.source_id,
-            "target": path.target_id,
-            "source_label": analyzer._label_of(path.source_id),
-            "target_label": analyzer._label_of(path.target_id),
-            "path": path.path,
-            "path_steps": [_normalize_path_step(step) for step in analyzer._build_attack_path(path.path).steps],
-            "edge_types": path.edge_types,
-            "hop_count": path.hop_count,
-            "path_score": path.path_score,
-            "risk_level": _risk_level(float(path.path_score or 0.0)),
-            "explanation": path.explanation,
+            "source": ap.source_id,
+            "target": ap.target_id,
+            "source_label": ap.source_label,
+            "target_label": ap.target_label,
+            "path": ap.node_ids,
+            "path_steps": [_normalize_path_step(step) for step in ap.steps],
+            "edge_types": ap.edge_types,
+            "hop_count": ap.hop_count,
+            "path_score": ap.path_score,
+            "risk_level": ap.risk_level or _risk_level(float(ap.path_score or 0.0)),
+            "explanation": ap.explanation,
         }
-        for path in paths
+        for ap in paths
     ]
 
 
@@ -338,21 +323,8 @@ async def get_tier0_blast_radius(
 ):
     """Return all entities that can reach Tier-0, with path counts."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    blast = await asyncio.to_thread(analyzer.compute_tier0_blast_radius)
-
-    results = []
-    for entity_id, path_count in sorted(blast.items(), key=lambda item: item[1], reverse=True)[:100]:
-        meta = analyzer.entity_meta.get(entity_id, {})
-        results.append({
-            "entity_id": entity_id,
-            "label": meta.get("sam_account_name") or meta.get("display_name") or entity_id[:12],
-            "type": meta.get("type"),
-            "tier": meta.get("tier"),
-            "paths_to_tier0": path_count,
-        })
-
-    return {"entities_in_blast_radius": len(blast), "top_100": results}
+    # TODO(neo4j-phase-3): port blast radius (GDS reachability) to Neo4j.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.post("/{assessment_id}/simulate-removal")
@@ -366,9 +338,8 @@ async def simulate_edge_removal(
     await require_assessment_access(assessment_id, db, current_user)
     if not edge_removals:
         raise HTTPException(status_code=400, detail="At least one edge removal must be specified")
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    pairs = [(edge.source, edge.target) for edge in edge_removals]
-    return await asyncio.to_thread(analyzer.simulate_edge_removal, pairs)
+    # TODO(neo4j-phase-5): port edge-removal simulation to Neo4j.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.post("/{assessment_id}/compute-paths")
@@ -379,98 +350,8 @@ async def compute_and_persist_paths(
 ):
     """Compute all attack paths and persist to exposure_paths table."""
     await require_assessment_write_access(assessment_id, db, current_user)
-
-    analyzer = await _get_analyzer(str(assessment_id), db)
-
-    def _compute():
-        rows = []
-        warnings: list[str] = []
-
-        # 1. Paths from top blast-radius sources → Tier-0
-        blast = analyzer.compute_tier0_blast_radius()
-        top_sources = sorted(blast.items(), key=lambda x: x[1], reverse=True)[:40]
-        for src_id, _ in top_sources:
-            try:
-                paths = analyzer.find_attack_paths_to_tier0(src_id, max_hops=8, max_paths=3)
-                for ap in paths:
-                    rows.append({
-                        "source_entity_id": _UUID(str(ap.source_id)) if ap.source_id else None,
-                        "target_entity_id": _UUID(str(ap.target_id)) if ap.target_id else None,
-                        "path_steps": [_normalize_path_step(s) for s in ap.steps],
-                        "hop_count": ap.hop_count,
-                        "path_score": round(ap.path_score, 2),
-                        "target_tier": 0,
-                        "path_type": "tier0_path",
-                        "explanation": ap.explanation or "",
-                    })
-            except Exception as exc:
-                log.warning("Tier-0 path computation skipped for one source: %s", exc, exc_info=True)
-                if len(warnings) < 10:
-                    warnings.append(f"Tier-0 path computation skipped for one source ({type(exc).__name__}).")
-
-        # 2. ACL abuse paths
-        try:
-            for ap in analyzer.detect_acl_abuse_paths(max_paths=20):
-                rows.append({
-                    "source_entity_id": _UUID(str(ap.source_id)) if ap.source_id else None,
-                    "target_entity_id": _UUID(str(ap.target_id)) if ap.target_id else None,
-                    "path_steps": [_normalize_path_step(s) for s in ap.steps],
-                    "hop_count": ap.hop_count, "path_score": round(ap.path_score, 2),
-                    "target_tier": ap.steps[-1].tier if ap.steps else None,
-                    "path_type": "acl_abuse", "explanation": ap.explanation or "",
-                })
-        except Exception as exc:
-            log.warning("ACL abuse path computation failed: %s", exc, exc_info=True)
-            if len(warnings) < 10:
-                warnings.append(f"ACL abuse path computation failed ({type(exc).__name__}).")
-
-        # Deduplicate by (path_score rounded, hop_count, first+last label)
-        seen: set = set()
-        deduped = []
-        for r in sorted(rows, key=lambda x: x["path_score"], reverse=True):
-            steps = r.get("path_steps", [])
-            key = (
-                round(r["path_score"]),
-                r["hop_count"],
-                steps[0].get("entity_label", "") if steps else "",
-                steps[-1].get("entity_label", "") if steps else "",
-            )
-            if key not in seen:
-                seen.add(key)
-                deduped.append(r)
-
-        return deduped[:200], warnings  # Cap at 200 persisted paths
-
-    path_rows, compute_warnings = await asyncio.to_thread(_compute)
-
-    # Replace persisted paths only after successful computation.
-    await db.execute(delete(ExposurePath).where(ExposurePath.assessment_id == assessment_id))
-    await db.flush()
-
-    # Bulk insert ExposurePath records
-    from uuid import uuid4 as _uuid4
-    for r in path_rows:
-        db.add(ExposurePath(
-            id=_uuid4(),
-            assessment_id=assessment_id,
-            source_entity_id=r["source_entity_id"],
-            target_entity_id=r["target_entity_id"],
-            path_steps=r["path_steps"],
-            hop_count=r["hop_count"],
-            path_score=r["path_score"],
-            target_tier=r["target_tier"],
-            path_type=r["path_type"],
-            explanation=r["explanation"],
-        ))
-    await db.commit()
-
-    return {
-        "paths_computed": len(path_rows),
-        "assessment_id": str(assessment_id),
-        "message": f"Computed and persisted {len(path_rows)} attack paths",
-        "warning_count": len(compute_warnings),
-        "warnings": compute_warnings,
-    }
+    # TODO(neo4j-phase-3/4): port path/detector computation + persistence to Neo4j.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/categories")
@@ -481,186 +362,8 @@ async def get_attack_categories(
 ):
     """Return attack paths grouped by technique category."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
-
-    def _compute_categories():
-        cats: dict = {}
-
-        def _ap_to_dict(ap) -> dict:
-            return _attack_path_to_dict(ap)
-
-        def _safe(fn, *args, default=None, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except Exception:
-                return default if default is not None else []
-
-        # Direct control inventory: every high-signal edge the operator can act on.
-        direct_edge_types = {
-            "GENERIC_ALL", "WRITE_DACL", "WRITE_OWNER", "OWNS", "FORCE_CHANGE_PASSWORD",
-            "ADD_MEMBER", "DCSYNC", "ALLOWED_TO_ACT", "ALLOWED_TO_DELEGATE",
-            "LOCAL_ADMIN", "ADMIN_TO", "CAN_ENROLL",
-        }
-        direct_paths = []
-        for src, tgt, edge_data in analyzer.graph.edges(data=True):
-            etype = edge_data.get("edge_type", "")
-            if etype not in direct_edge_types or src in analyzer._tier0:
-                continue
-            try:
-                direct_paths.append(analyzer._build_attack_path([src, tgt]))
-            except Exception:
-                continue
-        direct_paths.sort(
-            key=lambda p: (
-                p.path_score,
-                1 if any(label.startswith("ADG0D") for label in (p.source_label, p.target_label)) else 0,
-                -p.hop_count,
-            ),
-            reverse=True,
-        )
-        cats["direct_control"] = {"name": "Direct Control", "icon": "crosshair", "color": "#fb7185",
-                                  "count": len(direct_paths), "paths": [_ap_to_dict(p) for p in direct_paths[:160]]}
-
-        # ACL Abuse
-        acl = _safe(analyzer.detect_acl_abuse_paths, max_paths=30)
-        cats["acl_abuse"] = {"name": "ACL Abuse", "icon": "shield-x", "color": "#ef4444",
-                              "count": len(acl), "paths": [_ap_to_dict(p) for p in acl[:10]]}
-
-        # Shadow Admins
-        shadows = _safe(analyzer.detect_shadow_admins)
-        shadow_paths = []
-        for s in shadows[:10]:
-            shadow_paths.append({
-                "source_id": s.entity_id,
-                "target_id": None,
-                "source_label": s.entity_label, "target_label": "Tier-0 (via ACL)",
-                "hop_count": 1, "path_score": round(float(s.risk_score), 2),
-                "risk_level": "CRITICAL" if s.risk_score >= 85 else "HIGH",
-                "explanation": f"{s.entity_label} has direct control over {len(s.targets)} Tier-0 object(s)",
-                "steps": [], "edge_types": s.control_paths,
-            })
-        cats["shadow_admin"] = {"name": "Shadow Admin", "icon": "user-x", "color": "#a855f7",
-                                  "count": len(shadows), "paths": shadow_paths}
-
-        # Kerberoastable
-        kerb = _safe(analyzer.detect_kerberoastable_paths)
-        kerb_paths = []
-        for k in kerb[:10]:
-            kerb_paths.append({
-                "source_id": k.get("account_id"),
-                "target_id": None,
-                "source_label": k["account_label"], "target_label": "Crackable TGS",
-                "hop_count": 1, "path_score": round(float(k["risk_score"]), 2),
-                "risk_level": "CRITICAL" if k["risk_score"] >= 85 else "HIGH",
-                "explanation": k.get("attack") or f"{k['account_label']} has SPN registered — TGS hash can be requested and cracked offline",
-                "steps": [], "edge_types": ["HAS_SPN"],
-            })
-        cats["kerberoast"] = {"name": "Kerberoast", "icon": "key", "color": "#f97316",
-                               "count": len(kerb), "paths": kerb_paths}
-
-        # AS-REP Roastable
-        asrep = _safe(analyzer.detect_asrep_roastable)
-        asrep_paths = []
-        for a in asrep[:10]:
-            asrep_paths.append({
-                "source_id": None,
-                "target_id": a.get("account_id"),
-                "source_label": "Unauthenticated Attacker", "target_label": a["account_label"],
-                "hop_count": 1, "path_score": round(float(a["risk_score"]), 2),
-                "risk_level": "CRITICAL" if a["risk_score"] >= 85 else "HIGH",
-                "explanation": a.get("attack") or f"{a['account_label']} has pre-auth disabled — AS-REP hash retrievable without credentials",
-                "steps": [], "edge_types": ["ASREP_ROAST"],
-            })
-        cats["asrep"] = {"name": "AS-REP Roast", "icon": "zap", "color": "#eab308",
-                          "count": len(asrep), "paths": asrep_paths}
-
-        # Delegation (Unconstrained + Constrained + RBCD)
-        ucd = _safe(analyzer.detect_unconstrained_delegation)
-        ucd_paths = []
-        for d in ucd[:10]:
-            ucd_paths.append({
-                "source_id": d.entity_id,
-                "target_id": None,
-                "source_label": d.entity_label, "target_label": (d.delegation_targets[0] if d.delegation_targets else "Any Tier-0"),
-                "hop_count": 1, "path_score": round(float(d.risk_score), 2),
-                "risk_level": "CRITICAL",
-                "explanation": getattr(d, 'explanation', None) or f"{d.entity_label} has unconstrained delegation — captures TGTs of any authenticating user",
-                "steps": [], "edge_types": ["ALLOWED_TO_DELEGATE"],
-            })
-        cod = _safe(analyzer.detect_constrained_delegation_abuse)
-        ucd_paths += [{
-            "source_id": d.entity_id,
-            "target_id": None,
-            "source_label": d.entity_label, "target_label": (d.delegation_targets[0] if d.delegation_targets else "Target SPN"),
-            "hop_count": 1, "path_score": round(float(d.risk_score), 2),
-            "risk_level": "HIGH",
-            "explanation": getattr(d, 'explanation', None) or f"{d.entity_label} has constrained delegation — S4U2Proxy abuse possible",
-            "steps": [], "edge_types": ["ALLOWED_TO_DELEGATE"],
-        } for d in cod[:5]]
-        rbcd = _safe(analyzer.detect_rbcd_abuse)
-        ucd_paths += [{
-            "source_id": d.entity_id,
-            "target_id": None,
-            "source_label": d.entity_label, "target_label": (d.delegation_targets[0] if d.delegation_targets else "RBCD Target"),
-            "hop_count": 1, "path_score": round(float(d.risk_score), 2),
-            "risk_level": "HIGH",
-            "explanation": getattr(d, 'explanation', None) or f"{d.entity_label} — RBCD configured, impersonation possible",
-            "steps": [], "edge_types": ["ALLOWED_TO_ACT"],
-        } for d in rbcd[:5]]
-        cats["delegation"] = {"name": "Delegation", "icon": "repeat", "color": "#06b6d4",
-                               "count": len(ucd) + len(cod) + len(rbcd), "paths": ucd_paths[:10]}
-
-        # ADCS
-        adcs = _safe(analyzer.detect_adcs_paths)
-        adcs_paths = []
-        for a in adcs[:10]:
-            adcs_paths.append({
-                "source_id": None,
-                "target_id": None,
-                "source_label": (a.enrolling_principals[0] if a.enrolling_principals else "Any Domain User"), "target_label": a.ca_name or "CA",
-                "hop_count": 1, "path_score": round(float(a.risk_score), 2),
-                "risk_level": "CRITICAL" if a.risk_score >= 85 else "HIGH",
-                "explanation": f"{a.esc_type}: {a.template_name} — {a.description}",
-                "steps": [], "edge_types": ["CAN_ENROLL"],
-            })
-        cats["adcs"] = {"name": "ADCS / PKI", "icon": "certificate", "color": "#10b981",
-                         "count": len(adcs), "paths": adcs_paths}
-
-        # DCSync
-        dcsync = _safe(analyzer.detect_dcsync_principals)
-        dc_paths = [{
-            "source_id": d.get("principal_id"),
-            "target_id": d.get("target_id"),
-            "source_label": d["principal_label"], "target_label": d.get("target_label") or "NTDS.dit (All Hashes)",
-            "hop_count": 1, "path_score": 100.0, "risk_level": "CRITICAL",
-            "explanation": f"{d['principal_label']} has DCSync rights on {d.get('target_label', 'the domain')} — can replicate all AD secrets",
-            "steps": [], "edge_types": ["DCSYNC"],
-        } for d in dcsync[:10]]
-        cats["dcsync"] = {"name": "DCSync", "icon": "database", "color": "#ef4444",
-                           "count": len(dcsync), "paths": dc_paths}
-
-        return cats
-
-    categories = await asyncio.to_thread(_compute_categories)
-
-    total_paths = sum(c["count"] for c in categories.values())
-    critical_count = sum(
-        sum(1 for p in c["paths"] if p.get("risk_level") == "CRITICAL")
-        for c in categories.values()
-    )
-    edge_type_counts: dict[str, int] = {}
-    for category in categories.values():
-        for path in category.get("paths", []):
-            for edge_type in path.get("edge_types", []) or []:
-                if not edge_type:
-                    continue
-                edge_type_counts[edge_type] = edge_type_counts.get(edge_type, 0) + 1
-    return {
-        "categories": categories,
-        "total_paths": total_paths,
-        "critical_count": critical_count,
-        "edge_type_counts": edge_type_counts,
-    }
+    # TODO(neo4j-phase-4): port attack-path detectors/categories to Neo4j.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/choke-points")
@@ -671,22 +374,8 @@ async def get_choke_points(
 ):
     """Return top choke points with removal impact simulation."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
-
-    def _compute():
-        try:
-            chokes = analyzer.find_choke_points(top_n=15)
-            result = []
-            for cp in chokes:
-                d = dataclasses.asdict(cp) if dataclasses.is_dataclass(cp) else vars(cp)
-                result.append(d)
-            return result
-        except Exception as exc:
-            log.warning("Choke point computation failed: %s", exc)
-            return []
-
-    choke_points = await asyncio.to_thread(_compute)
-    return {"choke_points": choke_points, "count": len(choke_points)}
+    # TODO(neo4j-phase-3): port choke-point (betweenness) analysis to Neo4j/GDS.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/communities")
@@ -697,17 +386,8 @@ async def get_communities(
 ):
     """Return Louvain community partition for the assessment graph."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
-
-    def _compute():
-        try:
-            return analyzer.get_communities_summary()
-        except Exception as exc:
-            log.warning("Community detection failed: %s", exc)
-            return []
-
-    communities = await asyncio.to_thread(_compute)
-    return {"communities": communities, "count": len(communities)}
+    # TODO(neo4j-phase-3): port community detection (Louvain) to Neo4j/GDS.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/centrality")
@@ -718,49 +398,8 @@ async def get_centrality(
 ):
     """Return centrality metrics, computing and persisting on first call (1hr cache)."""
     await require_assessment_access(assessment_id, db, current_user)
-    from adbygod_api.models import GraphCentrality as GraphCentralityModel
-    from datetime import timedelta
-    from uuid import uuid4
-
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
-    existing = await db.execute(
-        select(GraphCentralityModel)
-        .where(GraphCentralityModel.assessment_id == assessment_id)
-        .limit(1)
-    )
-    row = existing.scalar_one_or_none()
-    if row and row.computed_at > cutoff:
-        all_rows = await db.execute(
-            select(GraphCentralityModel).where(GraphCentralityModel.assessment_id == assessment_id)
-        )
-        nodes = [
-            {"entity_id": str(r.entity_id), "betweenness": r.betweenness,
-             "degree_centrality": r.degree_centrality, "eigenvector": r.eigenvector,
-             "pagerank": r.pagerank}
-            for r in all_rows.scalars().all()
-        ]
-        return {"nodes": nodes, "cached": True}
-
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    metrics = await asyncio.to_thread(analyzer.compute_centrality_metrics)
-
-    await db.execute(
-        delete(GraphCentralityModel).where(GraphCentralityModel.assessment_id == assessment_id)
-    )
-    for node_id, m in metrics.items():
-        try:
-            entity_uuid = UUID(node_id)
-        except ValueError:
-            continue
-        db.add(GraphCentralityModel(
-            id=uuid4(), assessment_id=assessment_id, entity_id=entity_uuid,
-            betweenness=m["betweenness"], degree_centrality=m["degree_centrality"],
-            eigenvector=m["eigenvector"], pagerank=m["pagerank"],
-        ))
-    await db.commit()
-
-    nodes = [{"entity_id": nid, **m} for nid, m in metrics.items()]
-    return {"nodes": nodes, "cached": False}
+    # TODO(neo4j-phase-3): port centrality metrics to Neo4j/GDS.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/neighborhood/{node_id}")
@@ -774,9 +413,8 @@ async def get_neighborhood(
 ):
     """Return the N-hop subgraph around a single node."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    result = await asyncio.to_thread(analyzer.get_neighborhood, node_id, hops, max_nodes)
-    return result
+    service = _get_service(str(assessment_id))
+    return await _run_query(service.get_neighborhood(node_id, hops, max_nodes))
 
 
 @router.post("/{assessment_id}/layout")
@@ -863,8 +501,8 @@ async def create_snapshot(
     await require_assessment_access(assessment_id, db, current_user)
     from adbygod_api.models import GraphSnapshot
     from uuid import uuid4
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    data = analyzer.export_for_frontend(max_nodes=5000)
+    service = _get_service(str(assessment_id))
+    data = await _run_query(service.export_for_frontend(max_nodes=5000))
     snap = GraphSnapshot(
         id=uuid4(), assessment_id=assessment_id, user_id=current_user.id,
         label=body.label, node_count=data["node_count"], edge_count=data["edge_count"],
@@ -1224,187 +862,8 @@ async def nl_graph_query(
     await require_assessment_access(assessment_id, db, current_user)
     if not body.query.strip():
         raise HTTPException(status_code=400, detail="Query must not be empty")
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    q = body.query.lower()
-    node_ids: list[str] = []
-    edge_ids: list[str] = []
-    explanation = ""
-    PATTERNS = [
-        # Kerberos attacks
-        (["kerberoast", "kerberoastable", "has spn", "spn"],
-         lambda: [n for n in analyzer.graph.nodes() if
-                  any(d.get("edge_type") == "HAS_SPN"
-                      for _, _, d in analyzer.graph.out_edges(n, data=True))],
-         "node", "Kerberoastable accounts (nodes with HAS_SPN edges)"),
-        (["as-rep", "asrep", "as rep", "preauth", "doesnotrequirepreauth", "no preauth"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("uac_dont_req_preauth")
-                  and analyzer.entity_meta.get(n, {}).get("type") == "USER"],
-         "node", "AS-REP roastable accounts (no preauthentication required)"),
-        # DCSync / replication
-        (["dcsync", "dc sync", "replication", "replicate", "getchanges"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "DCSYNC"],
-         "node", "Accounts with DCSync rights"),
-        # Tier-0 / domain admins
-        (["tier 0", "tier-0", "domain admin", "privileged", "enterprise admin"],
-         lambda: [n for n in analyzer.graph.nodes() if analyzer.is_tier0(n)],
-         "node", "Tier-0 privileged nodes"),
-        # Delegation
-        (["unconstrained", "unconstrained delegation", "trusted for delegation"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("uac_trusted_for_deleg")],
-         "node", "Hosts with unconstrained delegation"),
-        (["constrained delegation", "constrained", "allowed to delegate", "s4u"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True)
-                  if d.get("edge_type") in ("ALLOWED_TO_DELEGATE",)],
-         "node", "Accounts with constrained delegation"),
-        (["delegation", "delegate", "allowed to act", "rbcd", "resource based"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True)
-                  if d.get("edge_type") in ("ALLOWED_TO_DELEGATE", "ALLOWED_TO_ACT")],
-         "node", "Nodes with delegation rights"),
-        # ACL abuse
-        (["genericall", "generic all", "full control", "full rights"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "GENERIC_ALL"],
-         "node", "Nodes with GenericAll rights"),
-        (["writedacl", "write dacl", "write the dacl", "dacl"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "WRITE_DACL"],
-         "node", "Nodes with WriteDACL rights"),
-        (["writeowner", "write owner", "owns"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "WRITE_OWNER"],
-         "node", "Nodes with WriteOwner rights"),
-        (["genericwrite", "generic write"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "GENERIC_WRITE"],
-         "node", "Nodes with GenericWrite rights"),
-        (["forcechangepassword", "force change password", "change password", "reset password"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True)
-                  if d.get("edge_type") in ("FORCE_CHANGE_PASSWORD", "HAS_CONTROL")],
-         "node", "Accounts that can force password change"),
-        (["acl", "access control", "ace", "abuse"],
-         lambda: list({u for u, v, d in analyzer.graph.edges(data=True)
-                       if d.get("edge_type") in ("GENERIC_ALL", "WRITE_DACL", "WRITE_OWNER",
-                                                  "GENERIC_WRITE", "FORCE_CHANGE_PASSWORD")}),
-         "node", "Nodes with abusable ACL rights"),
-        # Risk-based
-        (["high risk", "critical edge", "critical path", "critical"],
-         lambda: [str(d.get("id", f"{u}__{v}")) for u, v, d in analyzer.graph.edges(data=True)
-                  if d.get("risk_weight", 0) >= 0.8],
-         "edge", "Critical-risk edges (risk >= 80%)"),
-        (["medium risk", "medium"],
-         lambda: [str(d.get("id", f"{u}__{v}")) for u, v, d in analyzer.graph.edges(data=True)
-                  if 0.5 <= d.get("risk_weight", 0) < 0.8],
-         "edge", "Medium-risk edges (50-79%)"),
-        # Object types
-        (["computer", "workstation", "server", "machine", "host", "device"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("type") == "COMPUTER"],
-         "node", "Computer objects"),
-        (["user", "users", "user account", "person", "people", "human"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("type") == "USER"],
-         "node", "User accounts"),
-        (["group", "groups", "group member"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("type") == "GROUP"],
-         "node", "Group objects"),
-        (["service account", "service accounts", "gmsa", "msa"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("gmsa")
-                  or (analyzer.entity_meta.get(n, {}).get("type") in ("USER", "SERVICE_ACCOUNT")
-                      and any(kw in (
-                          (analyzer.entity_meta.get(n, {}).get("sam_account_name") or "") + " " +
-                          (analyzer._label_of(n) or "")
-                      ).lower() for kw in ("svc", "service", "sa-", "_svc", "svc-")))],
-         "node", "Service accounts (gMSA or svc/service naming)"),
-        # Remote access
-        (["can rdp", "rdp access", "remote desktop", "rdp"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "CAN_RDP"],
-         "node", "Accounts with RDP access"),
-        (["can winrm", "winrm", "remote management", "wsman"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "CAN_WINRM"],
-         "node", "Accounts with WinRM access"),
-        (["sql admin", "sqladmin", "sql server", "xp_cmdshell"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "SQL_ADMIN"],
-         "node", "Accounts with SQL admin rights"),
-        (["golden cert", "golden certificate", "esc", "manage ca", "ca control"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True)
-                  if d.get("edge_type") in ("MANAGE_CA", "MANAGE_CERTIFICATES", "GOLDEN_CERT",
-                                             "CA_PRIVATE_KEY_CONTROL")],
-         "node", "Accounts with CA management or golden cert rights"),
-        (["read laps", "laps password", "laps read"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "READ_LAPS_PASSWORD"],
-         "node", "Accounts that can read LAPS passwords"),
-        (["crown jewel", "jewel", "high value target", "hvt"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("is_crown_jewel")],
-         "node", "Crown Jewel / high value targets"),
-        (["organizational unit", "container", " ou ", "ou:"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("type") in ("OU", "CONTAINER")],
-         "node", "Organizational units and containers"),
-        # AdminCount / sensitive
-        (["admin count", "admincount", "sensitive", "protected"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("is_admin_count")],
-         "node", "Objects with AdminCount=1"),
-        # Password / account hygiene
-        (["password never expire", "no password expiry", "pwdneverexpires", "password expiry", "never expire"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("attributes", {}).get("pwd_never_expires")
-                  and analyzer.entity_meta.get(n, {}).get("type") == "USER"],
-         "node", "Users with passwords that never expire"),
-        (["stale", "inactive", "old account", "disabled"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if not analyzer.entity_meta.get(n, {}).get("is_enabled", True)],
-         "node", "Disabled/inactive accounts"),
-        # Local admin (before LAPS — "local admin" would match LAPS if LAPS came first)
-        (["local admin", "admin to", "localadmin", "admin rights"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "ADMIN_TO"],
-         "node", "Accounts with local admin rights"),
-        (["laps", "no laps", "without laps", "laps missing", "local admin password"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("type") == "COMPUTER"
-                  and not analyzer.entity_meta.get(n, {}).get("laps_enabled")],
-         "node", "Computers without LAPS"),
-        # ADCS / PKI
-        (["certificate", "cert template", "adcs", "pki", "esc", "enrollment"],
-         lambda: [n for n in analyzer.graph.nodes()
-                  if analyzer.entity_meta.get(n, {}).get("type") in ("CERT_TEMPLATE", "CA")],
-         "node", "Certificate templates and CAs"),
-        # SID history
-        (["sid history", "sidhistory", "sid"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "HAS_SID_HISTORY"],
-         "node", "Accounts with SID history"),
-        # Shadow credentials
-        (["shadow credential", "shadow cred", "msds-keycredential", "keycredlink", "add key"],
-         lambda: [u for u, v, d in analyzer.graph.edges(data=True) if d.get("edge_type") == "ADD_KEY_CREDENTIAL_LINK"],
-         "node", "Accounts that can add shadow credentials"),
-    ]
-    for keywords, fn, result_type, desc in PATTERNS:
-        if any(kw in q for kw in keywords):
-            try:
-                ids = await asyncio.to_thread(fn)
-                if result_type == "node":
-                    node_ids = ids[:500]
-                else:
-                    edge_ids = ids[:500]
-                explanation = desc
-            except Exception:
-                pass
-            break
-    if not node_ids and not edge_ids:
-        explanation = (
-            f"No pattern matched for: '{body.query}'. "
-            "Try: kerberoastable, dcsync, tier-0, delegation, genericall, writedacl, "
-            "admincount, high risk, computers, users, groups, stale, laps, adcs, local admin"
-        )
-    return {
-        "query": body.query,
-        "filter_type": "node" if node_ids else "edge" if edge_ids else "none",
-        "node_ids": node_ids,
-        "edge_ids": edge_ids,
-        "result_count": len(node_ids) + len(edge_ids),
-        "explanation": explanation,
-    }
+    # TODO(neo4j-phase-4): port NL graph-query patterns to Cypher.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/anomalies")
@@ -1416,9 +875,8 @@ async def get_anomalies(
 ):
     """Detect statistical anomalies and recent edge changes."""
     await require_assessment_access(assessment_id, db, current_user)
-    analyzer = await _get_analyzer(str(assessment_id), db)
-    anomalies = await asyncio.to_thread(analyzer.detect_anomalies, days_back)
-    return {"anomalies": anomalies, "count": len(anomalies), "days_back": days_back}
+    # TODO(neo4j-phase-4): port anomaly detection to Neo4j.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
 
 @router.get("/{assessment_id}/diff-assessment")
@@ -1431,44 +889,56 @@ async def diff_assessment(
     """Diff current assessment graph against another assessment."""
     await require_assessment_access(assessment_id, db, current_user)
     await require_assessment_access(compare_to, db, current_user)
-    analyzer_a = await _get_analyzer(str(assessment_id), db)
-    analyzer_b = await _get_analyzer(str(compare_to), db)
+    # TODO(neo4j-phase-4): port cross-assessment graph diff to Neo4j.
+    raise HTTPException(status_code=501, detail=_PHASE3_DETAIL)
 
-    nodes_a = set(analyzer_a.graph.nodes())
-    nodes_b = set(analyzer_b.graph.nodes())
-    edges_a = {(u, v, d.get("edge_type")) for u, v, d in analyzer_a.graph.edges(data=True)}
-    edges_b = {(u, v, d.get("edge_type")) for u, v, d in analyzer_b.graph.edges(data=True)}
 
-    added_nodes = [
-        {"id": n, "label": analyzer_b._label_of(n), "type": analyzer_b.entity_meta.get(n, {}).get("type")}
-        for n in nodes_b - nodes_a
-    ]
-    removed_nodes = [
-        {"id": n, "label": analyzer_a._label_of(n), "type": analyzer_a.entity_meta.get(n, {}).get("type")}
-        for n in nodes_a - nodes_b
-    ]
-    added_edges = [
-        {"source": u, "target": v, "edge_type": et,
-         "source_label": analyzer_b._label_of(u), "target_label": analyzer_b._label_of(v)}
-        for u, v, et in edges_b - edges_a
-    ]
-    removed_edges = [
-        {"source": u, "target": v, "edge_type": et,
-         "source_label": analyzer_a._label_of(u), "target_label": analyzer_a._label_of(v)}
-        for u, v, et in edges_a - edges_b
-    ]
+def _enqueue_projection(assessment_id) -> None:
+    from adbygod_api.core.tasks.graph_projection import enqueue
+    enqueue(assessment_id)
 
+
+@router.post("/{assessment_id}/reproject", status_code=202)
+async def reproject_graph(
+    assessment_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: PlatformUser = Depends(get_current_user),
+):
+    """Enqueue a (re)projection of the assessment graph into Neo4j."""
+    await require_assessment_write_access(assessment_id, db, current_user)
+    state = await db.get(GraphProjectionState, assessment_id)
+    if state is None:
+        state = GraphProjectionState(assessment_id=assessment_id)
+        db.add(state)
+    state.status = "projecting"
+    await db.commit()
+    _enqueue_projection(assessment_id)
+    return {"status": "projecting", "assessment_id": str(assessment_id)}
+
+
+@router.get("/{assessment_id}/projection-state")
+async def get_projection_state(
+    assessment_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: PlatformUser = Depends(get_current_user),
+):
+    """Return the current Neo4j projection state for an assessment."""
+    await require_assessment_access(assessment_id, db, current_user)
+    state = await db.get(GraphProjectionState, assessment_id)
+    if state is None:
+        return {
+            "assessment_id": str(assessment_id),
+            "status": "pending",
+            "node_count": 0,
+            "edge_count": 0,
+            "last_projected_at": None,
+        }
     return {
         "assessment_id": str(assessment_id),
-        "compare_to": str(compare_to),
-        "added_nodes": added_nodes[:200],
-        "removed_nodes": removed_nodes[:200],
-        "added_edges": added_edges[:500],
-        "removed_edges": removed_edges[:500],
-        "summary": {
-            "new_nodes": len(added_nodes),
-            "removed_nodes": len(removed_nodes),
-            "new_edges": len(added_edges),
-            "removed_edges": len(removed_edges),
-        },
+        "status": state.status,
+        "node_count": state.node_count,
+        "edge_count": state.edge_count,
+        "last_projected_at": (
+            state.last_projected_at.isoformat() if state.last_projected_at else None
+        ),
     }

@@ -813,6 +813,18 @@ class AIOperatorStatus(str, enum.Enum):
     COMPLETED = "completed"
 
 
+class GraphProjectionState(Base):
+    __tablename__ = "graph_projection_state"
+
+    assessment_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(), ForeignKey("assessments.id"), primary_key=True
+    )
+    last_projected_at: Mapped[datetime | None] = mapped_column(DateTime)
+    node_count: Mapped[int] = mapped_column(Integer, default=0)
+    edge_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|projecting|ready|error
+
+
 class AIOperatorAction(Base):
     __tablename__ = "ai_operator_actions"
 

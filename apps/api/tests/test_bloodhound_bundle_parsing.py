@@ -240,19 +240,6 @@ def test_ingest_ca_flags_returns_500_on_bulk_insert_failure(test_app, monkeypatc
     assert response.status_code == 500
 
 
-def test_graph_cache_lock_exists_in_graph_module():
-    """graph.py must expose a module-level asyncio.Lock for cache protection."""
-    import asyncio
-    from adbygod_api.routes import graph as graph_mod
-
-    assert hasattr(graph_mod, "_graph_cache_lock"), (
-        "_graph_cache_lock must exist in graph module"
-    )
-    assert isinstance(graph_mod._graph_cache_lock, asyncio.Lock), (
-        "_graph_cache_lock must be an asyncio.Lock instance"
-    )
-
-
 def test_get_chain_lock_returns_same_lock_for_same_chain_id():
     """_get_chain_lock must return the same Lock instance for the same chain_id."""
     from adbygod_api.routes.chains import _get_chain_lock
@@ -280,9 +267,9 @@ def test_get_chain_lock_is_race_safe():
 
 
 def test_graph_paths_returns_503_on_timeout(test_app, monkeypatch):
-    """GET /graph/{id}/paths must return 503 if path computation exceeds 30 seconds."""
+    """GET /graph/{id}/paths must return 503 when the Neo4j query exceeds the
+    configured timeout (settings.GRAPH_QUERY_TIMEOUT_SECONDS)."""
     import asyncio
-    from unittest.mock import AsyncMock
     from adbygod_api.routes import graph as graph_mod
 
     db = test_app["db"]
@@ -297,19 +284,12 @@ def test_graph_paths_returns_503_on_timeout(test_app, monkeypatch):
     )
     token_headers = test_app["headers_for"](user)
 
-    class SlowAnalyzer:
-        def get_all_paths(self, *args, **kwargs):
-            import time
-            time.sleep(999)
-        def get_paths_to_tier0(self, *args, **kwargs):
-            import time
-            time.sleep(999)
-
+    # _run_query wraps the engine call in asyncio.wait_for; force it to time out.
     async def fast_timeout(coro, timeout):
+        coro.close()  # avoid "coroutine was never awaited" noise
         raise asyncio.TimeoutError()
 
     monkeypatch.setattr(graph_mod.asyncio, "wait_for", fast_timeout)
-    monkeypatch.setattr(graph_mod, "_get_analyzer", AsyncMock(return_value=SlowAnalyzer()))
 
     response = test_app["client"].get(
         f"/api/v1/graph/{assessment.id}/paths",

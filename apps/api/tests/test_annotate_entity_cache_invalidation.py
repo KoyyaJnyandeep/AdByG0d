@@ -1,5 +1,7 @@
-"""Unit test: _annotate_entity must invalidate the graph export cache after
-committing entity field changes so the graph UI does not serve stale data."""
+"""_annotate_entity must enqueue a Neo4j re-projection after committing entity
+field changes, so the derived graph read-model (and the graph UI) does not serve
+stale data. (Replaces the old in-memory invalidate_graph_cache mechanism, which
+was removed when the graph routes moved to Neo4j.)"""
 from __future__ import annotations
 
 import uuid
@@ -10,7 +12,8 @@ from adbygod_api.core.ai_operator.tools.write_tools import HANDLERS
 from adbygod_api.models import EntityType
 
 _AUTHZ_WRITE = "adbygod_api.core.security.authorization.require_assessment_write_access"
-_INVALIDATE = "adbygod_api.routes.graph.invalidate_graph_cache"
+_ENQUEUE = "adbygod_api.core.tasks.graph_projection.enqueue"
+_BROADCAST = "adbygod_api.core.graph.websocket_manager.broadcast_graph_delta"
 
 
 def _make_ctx(aid, entity):
@@ -44,55 +47,52 @@ def _make_entity(eid, aid):
 
 
 @pytest.mark.asyncio
-async def test_annotate_entity_invalidates_cache_on_crown_jewel_change():
-    """Setting is_crown_jewel must trigger invalidate_graph_cache for the assessment."""
+async def test_annotate_entity_enqueues_projection_on_crown_jewel_change():
+    """Setting is_crown_jewel must enqueue a re-projection for the assessment."""
     aid = str(uuid.uuid4())
     eid = uuid.uuid4()
-    entity = _make_entity(eid, aid)
-    ctx = _make_ctx(aid, entity)
+    ctx = _make_ctx(aid, _make_entity(eid, aid))
 
-    with patch(_AUTHZ_WRITE, new=AsyncMock()):
-        with patch(_INVALIDATE) as mock_invalidate:
-            result = await HANDLERS["annotate_entity"](
-                {"entity_id": str(eid), "assessment_id": aid, "is_crown_jewel": True},
-                ctx,
-            )
+    with patch(_AUTHZ_WRITE, new=AsyncMock()), \
+         patch(_BROADCAST, new=AsyncMock()), \
+         patch(_ENQUEUE) as mock_enqueue:
+        result = await HANDLERS["annotate_entity"](
+            {"entity_id": str(eid), "assessment_id": aid, "is_crown_jewel": True}, ctx,
+        )
 
-    mock_invalidate.assert_called_once_with(aid)
+    mock_enqueue.assert_called_once_with(aid)
     assert result["is_crown_jewel"] is True
 
 
 @pytest.mark.asyncio
-async def test_annotate_entity_invalidates_cache_on_sensitive_change():
-    """Setting is_sensitive must also invalidate the cache."""
+async def test_annotate_entity_enqueues_projection_on_sensitive_change():
+    """Setting is_sensitive must also enqueue a re-projection."""
     aid = str(uuid.uuid4())
     eid = uuid.uuid4()
-    entity = _make_entity(eid, aid)
-    ctx = _make_ctx(aid, entity)
+    ctx = _make_ctx(aid, _make_entity(eid, aid))
 
-    with patch(_AUTHZ_WRITE, new=AsyncMock()):
-        with patch(_INVALIDATE) as mock_invalidate:
-            await HANDLERS["annotate_entity"](
-                {"entity_id": str(eid), "assessment_id": aid, "is_sensitive": True},
-                ctx,
-            )
+    with patch(_AUTHZ_WRITE, new=AsyncMock()), \
+         patch(_BROADCAST, new=AsyncMock()), \
+         patch(_ENQUEUE) as mock_enqueue:
+        await HANDLERS["annotate_entity"](
+            {"entity_id": str(eid), "assessment_id": aid, "is_sensitive": True}, ctx,
+        )
 
-    mock_invalidate.assert_called_once_with(aid)
+    mock_enqueue.assert_called_once_with(aid)
 
 
 @pytest.mark.asyncio
-async def test_annotate_entity_cache_invalidation_survives_import_error():
-    """Even if routes.graph cannot be imported, annotate_entity must not raise."""
+async def test_annotate_entity_survives_projection_enqueue_error():
+    """If enqueuing the projection fails, annotate_entity must not raise."""
     aid = str(uuid.uuid4())
     eid = uuid.uuid4()
-    entity = _make_entity(eid, aid)
-    ctx = _make_ctx(aid, entity)
+    ctx = _make_ctx(aid, _make_entity(eid, aid))
 
-    with patch(_AUTHZ_WRITE, new=AsyncMock()):
-        with patch(_INVALIDATE, side_effect=ImportError("routes not loaded")):
-            result = await HANDLERS["annotate_entity"](
-                {"entity_id": str(eid), "assessment_id": aid, "is_crown_jewel": True},
-                ctx,
-            )
+    with patch(_AUTHZ_WRITE, new=AsyncMock()), \
+         patch(_BROADCAST, new=AsyncMock()), \
+         patch(_ENQUEUE, side_effect=RuntimeError("broker unavailable")):
+        result = await HANDLERS["annotate_entity"](
+            {"entity_id": str(eid), "assessment_id": aid, "is_crown_jewel": True}, ctx,
+        )
 
     assert result.get("updated") is True
