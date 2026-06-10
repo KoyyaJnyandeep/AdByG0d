@@ -28,8 +28,8 @@ The maintainer targets **enterprise scale: 100k+ nodes, millions of edges** (ful
 
 - Move heavy graph traversal and analytics to **Neo4j** (with the **GDS** — Graph Data Science — plugin) so path-finding and centrality scale to 100k+ nodes / millions of edges.
 - Preserve the existing **HTTP API contract** and the **frontend data shape** — `routes/graph.py`, `routes/chains.py`, and `apps/web` should need minimal or no change.
-- Migrate **method-by-method** behind an abstraction, with parity tests against the current NetworkX implementation — never a big-bang rewrite.
-- Keep a **lightweight dev path** (SQLite + NetworkX) available behind a config flag.
+- Migrate **method-by-method** behind a single internal seam, validated by golden-fixture tests — never a big-bang rewrite.
+- **Neo4j everywhere, including dev.** Ship a lightweight `docker-compose.dev.yml` (Neo4j + GDS) so local and prod run identical code paths. No SQLite/NetworkX runtime fallback.
 
 ### Non-goals
 
@@ -45,6 +45,9 @@ The maintainer targets **enterprise scale: 100k+ nodes, millions of edges** (ful
 | Target scale | Enterprise: 100k+ nodes, millions of edges |
 | Operational appetite | "Whatever performs best" — operational cost & licensing secondary |
 | Sync model | **Option A — Projection.** Postgres is source of truth; Neo4j is a derived, rebuildable read-model |
+| Dev/prod parity | **Neo4j-only everywhere.** Drop the SQLite/NetworkX runtime fallback; ship `docker-compose.dev.yml` with Neo4j so dev == prod. Avoids Python↔Cypher behavior drift across ~70 methods |
+| Neo4j version | **`neo4j:5-community` + GDS plugin**, pinned. v5's memory management and bulk `UNWIND`/`apoc` throughput suit the projection model; no 4.x |
+| Analytics engine | **GDS library** for centrality & community detection — keeps heavy analytics off the transactional engine. CE's 4-core cap is sufficient at 100k-node scale |
 
 ## 4. Architecture — hybrid (Postgres source of truth + Neo4j graph engine)
 
@@ -60,7 +63,7 @@ The maintainer targets **enterprise scale: 100k+ nodes, millions of edges** (ful
                           ▲                                                       ▲
                           │ relational reads (findings, users, audit…)            │ Cypher / GDS reads
                           │                                                       │ (paths, blast radius,
-                   FastAPI routes ──────── GraphBackend abstraction ──────────────┘  communities, centrality)
+                   FastAPI routes ──────── Neo4jGraphService ────────────────────┘  communities, centrality)
                           │
                           ▼
                   Next.js / d3-force  (unchanged JSON contract)
@@ -69,7 +72,7 @@ The maintainer targets **enterprise scale: 100k+ nodes, millions of edges** (ful
 - **Postgres** stays authoritative. All existing ingest/dedup/finding logic is untouched.
 - **Neo4j** is a **derived read-model**: it can be wiped and rebuilt from Postgres at any time. After each ingest the affected assessment is **projected** into Neo4j (batched). A `reproject` operation rebuilds an assessment's subgraph from scratch.
 - All **graph queries** (traversal + analytics) run on Neo4j/GDS. Relational/metadata reads stay on Postgres.
-- A **`GraphBackend` abstraction** sits between the routes and the engine, with two implementations: `NetworkXBackend` (current behavior, dev/fallback) and `Neo4jBackend` (new, prod default). Selected by `GRAPH_BACKEND` config.
+- A single **`Neo4jGraphService`** sits between the routes and the engine — one runtime implementation, no NetworkX fallback. Dev and prod run identical code (Neo4j in both via `docker-compose.dev.yml`).
 
 ## 5. Data model mapping
 
@@ -107,16 +110,13 @@ Carry the fields the analyzer and frontend actually use:
 
 ## 6. Components
 
-### 6.1 `GraphBackend` abstraction (`core/graph/backends/`)
+### 6.1 `Neo4jGraphService` (`core/graph/neo4j_graph_service.py`)
 
-A `Protocol` (or ABC) declaring the methods the routes actually consume — the subset of `ADGraphAnalyzer`'s ~70 methods that are reachable from `routes/` and `core/analyzers/`. Two implementations:
+A **single** service class exposing the methods the routes actually consume — the subset of `ADGraphAnalyzer`'s ~70 methods reachable from `routes/` and `core/analyzers/`. Each method is a Cypher/GDS query scoped by `assessment_id`, backed by the shared async driver. There is **no second implementation and no `GRAPH_BACKEND` switch** — Neo4j runs in dev and prod alike.
 
-- **`NetworkXBackend`** — wraps today's `ADGraphAnalyzer` unchanged. Default when `GRAPH_BACKEND=networkx`. Keeps SQLite-only dev a pure `pip install`.
-- **`Neo4jBackend`** — backed by the Neo4j async driver; each method is a Cypher/GDS query scoped by `assessment_id`. Default when `GRAPH_BACKEND=neo4j`.
+`routes/graph.py`'s `_get_analyzer(assessment_id, db)` becomes `_get_service(assessment_id)` returning the Neo4j-backed service. The per-process `_graph_cache` of in-memory NetworkX graphs is **removed** (Neo4j is the shared store); a small LRU of *GDS named-projection handles* may remain to avoid re-projecting for back-to-back analytics calls.
 
-`routes/graph.py`'s `_get_analyzer(assessment_id, db)` becomes `_get_backend(assessment_id, db)` returning the configured backend. For Neo4j the per-process `_graph_cache` of in-memory graphs is **removed** (Neo4j is the shared cache); a small LRU of *driver sessions / GDS projection handles* may remain.
-
-> **Method-by-method migration:** `Neo4jBackend` may initially delegate un-ported methods to `NetworkXBackend` (lazy-loading that assessment's graph) so we ship value incrementally. The phase plan ports the highest-value traversal/analytics methods first.
+> **Method-by-method migration:** because there is no NetworkX fallback at runtime, the feature branch is built up in phases (see §8) and is not merged until the core query phases are functional. The retired `graph_service.py` (NetworkX) is kept **out of the runtime** and used only as a one-time **golden-fixture generator** for tests (see §10), then removed once parity fixtures are frozen.
 
 ### 6.2 Neo4j driver & lifecycle (`core/graph/neo4j_client.py`)
 
@@ -142,7 +142,6 @@ A `Protocol` (or ABC) declaring the methods the routes actually consume — the 
 ### 6.5 Config additions (`config.py`)
 
 ```
-GRAPH_BACKEND: str = "networkx"          # "neo4j" | "networkx"
 NEO4J_URI: str = "bolt://localhost:7687"
 NEO4J_USER: str = "neo4j"
 NEO4J_PASSWORD: str = ""
@@ -151,47 +150,51 @@ GRAPH_QUERY_TIMEOUT_SECONDS: int = 30
 GRAPH_PROJECT_BATCH_SIZE: int = 10000
 ```
 
-Prod (`docker-compose.prod.yml`, `.env.docker.example`) defaults `GRAPH_BACKEND=neo4j`; local dev defaults to `networkx`.
+No `GRAPH_BACKEND` flag — Neo4j is required in every environment. `.env.docker.example` documents the `NEO4J_*` vars.
 
-### 6.6 Deployment (`docker-compose.yml` / `.prod.yml`)
+### 6.6 Deployment (`docker-compose.yml` / `.prod.yml` / new `docker-compose.dev.yml`)
 
-Add a `neo4j` service (Community + GDS plugin), e.g. `neo4j:5-community` with `NEO4J_PLUGINS=["graph-data-science"]`, a named volume, heap/pagecache sized for the target graph, healthcheck, and `api`/`worker` depending on it. Add `neo4j` Python driver to `requirements.txt`.
+Add a `neo4j` service pinned to **`neo4j:5-community`** with `NEO4J_PLUGINS=["graph-data-science"]`, a named volume, heap/pagecache sized for the target graph, a healthcheck, and `api`/`worker` depending on it (healthy). Add the **`neo4j`** Python driver to `requirements.txt`.
+
+A new **`docker-compose.dev.yml`** brings up a lightweight Neo4j (smaller heap/pagecache) alongside the dev API/worker so local dev runs the **same Neo4j code path** as prod — no SQLite/NetworkX divergence. (Postgres can still be SQLite-on-disk for *relational* dev data; the graph engine is always Neo4j.)
+
+v5 is chosen for its memory management and bulk `UNWIND`/`apoc` throughput, which the projection model leans on heavily.
 
 ## 7. Data flow
 
 1. **Ingest** (unchanged) writes entities/edges to Postgres, commits.
 2. Post-commit hook **enqueues a projection** (Celery) for that `assessment_id`.
 3. Worker **projects** Postgres rows → Neo4j (batched UNWIND/MERGE), updates `last_projected_at`.
-4. **Query** requests hit `routes/graph.py` → `Neo4jBackend` → Cypher/GDS scoped by `assessment_id` → JSON in the existing shape → frontend.
+4. **Query** requests hit `routes/graph.py` → `Neo4jGraphService` → Cypher/GDS scoped by `assessment_id` → JSON in the existing shape → frontend.
 5. **Reproject** (manual or on detected drift) rebuilds an assessment's subgraph from Postgres.
 
 ## 8. Migration / phasing strategy
 
-Behind the `GraphBackend` abstraction, port in priority order; each phase keeps NetworkX parity tests green and can ship independently:
+The work lands on the `feat/neo4j-graph-engine` branch and is **not merged until Phase 2 is functional** (there is no NetworkX fallback, so graph routes must work on Neo4j before merge). Each phase is validated by golden-fixture tests:
 
-- **Phase 0 — Scaffolding:** Neo4j service in compose, driver/lifecycle, config, constraints/indexes, `GraphBackend` Protocol with `NetworkXBackend` wrapping current code (no behavior change).
+- **Phase 0 — Scaffolding:** Neo4j service in `docker-compose*.yml` (incl. new `docker-compose.dev.yml`), `neo4j` driver dependency, driver/lifecycle, config (`NEO4J_*`), startup constraints/indexes, empty `Neo4jGraphService` skeleton.
 - **Phase 1 — Projection:** projection service + Celery task + reproject endpoint + ingest hook. Neo4j now mirrors Postgres.
-- **Phase 2 — Core traversal:** shortest / all-shortest / k-shortest paths, reachability, neighborhood, `export_for_frontend`. These cover the hot Graph Explorer + Attack Paths views.
+- **Phase 2 — Core traversal (merge gate):** shortest / all-shortest / k-shortest paths, reachability, neighborhood, `export_for_frontend`. Covers the hot Graph Explorer + Attack Paths views. Routes switch from `_get_analyzer` to `_get_service`; `_graph_cache` removed.
 - **Phase 3 — Analytics (GDS):** centrality, communities, blast radius, choke points, critical nodes, domain dominance.
 - **Phase 4 — Detectors:** `detect_*` pattern queries.
 - **Phase 5 — Simulation:** edge-removal / node-hardening / remediation ranking.
-- **Phase 6 — Default flip & cleanup:** prod default `GRAPH_BACKEND=neo4j`; NetworkX retained as dev/fallback.
+- **Phase 6 — Cleanup:** delete the runtime NetworkX `graph_service.py` (after its outputs are frozen as test fixtures), `python-louvain`/NetworkX deps where no longer used, and the old cache plumbing.
 
 ## 9. Error handling & consistency
 
 - **Projection lag:** Neo4j may briefly trail Postgres after ingest. The UI shows projection state; queries are best-effort against the latest projection. Acceptable per Option A.
-- **Neo4j unavailable:** graph routes return a clear `503` with a "graph engine unavailable / projecting" signal (frontend already has a "no data / rebuilding" state). Optionally fall back to `NetworkXBackend` for an assessment if configured — explicit, not silent.
+- **Neo4j unavailable:** Neo4j is a hard dependency (no fallback). Graph routes return a clear `503` with a "graph engine unavailable / projecting" signal (frontend already has a "no data / rebuilding" state); health/ops route reports Neo4j status.
 - **Reproject is idempotent:** delete-then-load scoped by `assessment_id`; safe to re-run.
 - **Query timeouts:** `GRAPH_QUERY_TIMEOUT_SECONDS` enforced via Cypher tx timeout; mirrors the existing `_run_path_with_timeout` guard so a pathological query can't hang a worker.
 - **Drift detection:** compare Postgres vs Neo4j row counts per assessment; expose a "reproject needed" flag.
 
 ## 10. Testing
 
-- **Parity tests:** golden AD fixtures (small + medium) run through both `NetworkXBackend` and `Neo4jBackend`; assert identical results for paths, detectors, and `export_for_frontend` (order-normalized). This is the core safety net for the migration.
-- **Neo4j in tests:** ephemeral Neo4j via `testcontainers` (or a CI service container); skipped when unavailable so the existing pytest suite still runs without Neo4j locally.
+- **Golden-fixture tests:** run the *retired* NetworkX `graph_service.py` **once** over small + medium AD fixtures to snapshot expected outputs (paths, detectors, `export_for_frontend`, order-normalized). The `Neo4jGraphService` is then asserted against these **frozen fixtures** — no dual runtime, no live drift, and the NetworkX reference can be deleted afterward (§8 Phase 6).
+- **Neo4j in tests:** ephemeral Neo4j (+GDS) via `testcontainers` (or a CI service container). Graph tests **require** Neo4j; the non-graph suite (auth, ingest, findings, etc.) still runs without it.
 - **Projection tests:** ingest → project → query round-trip; reproject idempotency; incremental refresh after re-import.
-- **Scale smoke test:** synthetic 100k-node / 1M-edge generator; assert path/centrality queries complete within target latency and bounded memory.
-- Existing `apps/api/tests` continue to pass with `GRAPH_BACKEND=networkx` (default in CI unless the Neo4j job is selected).
+- **Scale smoke test:** synthetic 100k-node / 1M-edge generator; assert path/centrality queries complete within target latency and bounded Neo4j heap/pagecache.
+- CI gains a Neo4j service for the graph-test job; the rest of `apps/api/tests` runs as today.
 
 ## 11. Performance considerations
 
@@ -203,17 +206,20 @@ Behind the `GraphBackend` abstraction, port in priority order; each phase keeps 
 
 ## 12. Licensing note (recorded, deprioritized per decision)
 
-- **Neo4j Community Edition is GPLv3**; this repo is **MIT**. The **`neo4j` Python driver is Apache-2.0** (safe to depend on). **GDS Community** has its own license terms. Shipping the Neo4j server in `docker-compose` means operators pull a GPLv3 service alongside the MIT app. The maintainer chose "whatever performs best," accepting this; recorded here so it's a conscious, documented choice (and to revisit if the project's distribution model changes). BloodHound made the same Neo4j-based call.
+- **Neo4j Community Edition is GPLv3**; this repo is **MIT**. The **`neo4j` Python driver is Apache-2.0** (safe to depend on). **GDS runs on Community Edition with a 4-core (concurrency) cap** under its own license terms — accepted as sufficient at 100k-node scale. Shipping the Neo4j server in `docker-compose` means operators pull a GPLv3 service alongside the MIT app. The maintainer chose "whatever performs best," accepting this; recorded here so it's a conscious, documented choice (and to revisit if the project's distribution model changes). BloodHound made the same Neo4j-based call.
 
 ## 13. Risks
 
-- **Large surface (~70 analyzer methods):** mitigated by the abstraction + phased port + delegation to NetworkX for un-ported methods.
+- **Large surface (~70 analyzer methods):** mitigated by the phased port (§8) on an unmerged branch + golden-fixture parity tests frozen from the NetworkX reference. No runtime dual-implementation, so no live Python↔Cypher drift.
+- **No runtime fallback:** if Neo4j is down, graph features are down. Accepted (Neo4j-only decision); surfaced via health checks and `503`s, mitigated operationally (healthchecks, restart policy).
 - **Dual-store drift:** mitigated by reproject + drift detection; Postgres remains source of truth.
 - **GDS memory pressure** at full-forest scale: mitigated by on-demand named projections with TTL/release and tuned heap/pagecache.
 - **Operational weight** (new stateful JVM service): explicitly accepted.
 
-## 14. Open questions
+## 14. Resolved decisions
 
-1. **Dev fallback retained?** Plan keeps `NetworkXBackend` for SQLite-only dev behind `GRAPH_BACKEND`. Confirm you want this, or go Neo4j-only everywhere (simpler code, heavier dev setup).
-2. **Neo4j version pin** — target `neo4j:5-community` (with GDS) unless you have a reason to pin `4.x`.
-3. **GDS vs. hand-written Cypher** for centrality/communities — plan uses GDS for scale; acceptable to add the GDS plugin dependency.
+All brainstorming open questions are now closed (see §3):
+
+1. **Dev fallback?** ❌ Dropped. **Neo4j-only everywhere**; ship `docker-compose.dev.yml`. One runtime code path, no Python↔Cypher drift.
+2. **Neo4j version?** ✅ Pinned **`neo4j:5-community` + GDS**. No 4.x.
+3. **GDS for analytics?** ✅ Yes. GDS for centrality & community detection; CE 4-core cap accepted at 100k-node scale.
