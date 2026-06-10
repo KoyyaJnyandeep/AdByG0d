@@ -54,6 +54,7 @@ from adbygod_api.core.commands.catalog import get_collection_modules
 from adbygod_api.core.commands.architecture_catalog import ARCHITECTURE_ATTACK_MODULES, merge_architecture_modules
 from adbygod_api.core.commands.exposure_catalog import EXPOSURE_QUICK_CHECK_MODULES, merge_exposure_modules
 from adbygod_api.core.workers.pool import init_pool
+from adbygod_api.core.graph import neo4j_client
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.DEBUG if settings.DEBUG else logging.INFO),
@@ -75,7 +76,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     from adbygod_api.core.loot.hash_intel import recover_crack_jobs
     await recover_crack_jobs()
     log.info("Database tables verified — %s", settings.APP_VERSION)
+    await neo4j_client.connect()
+    await neo4j_client.ensure_schema()
     yield
+    await neo4j_client.close()
 
 
 async def security_headers(request: Request, call_next):
